@@ -33,7 +33,7 @@ result_page = {
 home_page = {
     "home_btn": '//*[@id="Navigator1_SearchHome1"]',
     "search_btn": '//*[@id="SearchFormEx1_btnSearch"]',
-    "s0": '//*[@id="SearchFormEx1_PINTextBox0"]',
+    "s0": '//*[@id="SearchFormEx1_PINTextBox0"]', 
     "s1": '//*[@id="SearchFormEx1_PINTextBox1"]',
     "s2": '//*[@id="SearchFormEx1_PINTextBox2"]',
     "s3": '//*[@id="SearchFormEx1_PINTextBox3"]',
@@ -60,6 +60,12 @@ def is_page_valid(driver, page_info):
     logger.info("Page is valid")
     return True
 
+def smart_action(driver, x_path, delay):
+    """Wrapper function to wait for the element to appear in the DOM"""
+    que = EC.presence_of_element_located((By.XPATH, x_path))
+    element = WebDriverWait(driver, delay).until(que)
+    return element
+
 def search_pin(driver, pin):
     """
     Searches the given pin on the home page
@@ -77,15 +83,21 @@ def search_pin(driver, pin):
     split_pin = pin.split("-")
     zipped_list = zip(split_pin, search_box)
     for pin_part, search_box in zipped_list:
-        element = driver.find_element_by_xpath(search_box)
-        element.clear()
-        element.send_keys(pin_part)
+        try:
+            element = smart_action(driver, search_box, m_delay)
+            element.clear() # some reason this raised stale element errors
+            element.send_keys(pin_part)
+        except NoSuchElementException:
+            logger.warning(f'{pin_part} failed to search')
+            return False
     
-    driver.find_element_by_xpath(home_page["search_btn"]).click()
+    element = smart_action(driver, home_page["search_btn"], s_delay)
+    element.click()
 
 def is_next_button_present(driver):
     """
-    Validator function. In case the table doesn't have a next button.
+    Validator function. To find end of tables and in case the table doesn't
+    have a next button.
 
     :driver: selenium webdriver object
     :returns: bool
@@ -96,7 +108,7 @@ def is_next_button_present(driver):
         logger.info("Next button was found")
         return True
     except NoSuchElementException:
-        logger.warning("Next button was NOT found")
+        logger.info("No next button found. End of table.")
         return False
 
 def go_to_next_page(driver):
@@ -148,6 +160,63 @@ def scrape_result_table(driver):
 
     return results
 
+def is_duplicate(conn, record):
+    """
+    To check if the record about to be added exits. #NoDupes
+    """
+    sql = """
+    SELECT * FROM records
+    WHERE 
+        recorded_date=? AND 
+        pin=? AND
+        type_desc=? AND
+        doc_num=? AND
+        first_grantor=? AND
+        first_grantee=? AND
+        first_prior_doc_num=?;
+    """
+    record_to_search = (
+        record["recorded_date"],
+        record["pin"],
+        record["type_desc"],
+        record["doc_num"],
+        record["first_grantor"],
+        record["first_grantee"],
+        record["first_prior_doc_num"]
+    )
+    cur = conn.cursor()
+    searched_record = cur.execute(sql, record_to_search)
+    if searched_record != None:
+        return False
+    else:
+        return True
+
+def insert_record_to_db(conn, record):
+    """
+    """
+    if is_duplicate(conn, record):
+        logger.info(f"Duplicated Record: {record}")
+    else:
+        # Setting up query
+        sql = """
+        INSERT INTO records (recorded_date, pin, type_desc, doc_num, first_grantor, first_grantee, first_prior_doc_num)
+        VALUES(?,?,?,?,?,?,?);
+        """
+        record_to_add = (
+            record["recorded_date"],
+            record["pin"],
+            record["type_desc"],
+            record["doc_num"],
+            record["first_grantor"],
+            record["first_grantee"],
+            record["first_prior_doc_num"]
+        )
+        
+        # Adding to db
+        cur = conn.cursor()
+        cur.execute(sql, record_to_add)
+        conn.commit()
+
 def save_scrape_to_csv(results):
     """
     Saves the results to a hardcoded outfile for now. Uses the 'a' flag
@@ -180,12 +249,13 @@ def search_and_save_pin(driver, pin):
     try:
         assert is_page_valid(driver, home_page) == True
 
-        print("Searching:", pin)
+        logger.info(f"Searching: {pin}")
         search_pin(driver, pin)
-        print("Searched:", pin)
+        logger.info(f"Searched: {pin}")
 
         # The case of n next buttons
         results = []
+        logger.info(f"Scraping: {pin}")
         if is_page_valid(driver, result_page) and is_next_button_present(driver):
             while is_next_button_present(driver):
                 result = scrape_result_table(driver)
@@ -198,6 +268,7 @@ def search_and_save_pin(driver, pin):
             result = scrape_result_table(driver)
             results += result
         
+        logger.info(f"Scraped: {pin}")
         save_scrape_to_csv(results)
         return_to_home_page(driver)
     
@@ -214,7 +285,7 @@ def main(pins):
     # Selenium init
     logger.info("Starting driver.")
     options = Options()
-    options.add_argument("--headless") # Comment out to see the browser
+    # options.add_argument("--headless") # Comment out to see the browser
     driver = webdriver.Firefox(options=options)
 
     try:
@@ -223,9 +294,16 @@ def main(pins):
         time.sleep(m_delay)
 
         for pin in pins:
-            print("Starting:", pin)
-            search_and_save_pin(driver, pin)
-            print("Finished:", pin)
+            logger.info(f"Starting: {pin}")
+
+            # General except in case of breakage, to keep on keeping on
+            try:
+                search_and_save_pin(driver, pin)
+                logger.info(f"Finished: {pin}")
+            except:
+                logging.exception(f"Error occured on {pin}")
+                logging.info("Moving on...")
+                pass 
                 
         time.sleep(m_delay)
 
@@ -241,13 +319,30 @@ if __name__ == "__main__":
     if not os.path.exists('logs'):
         os.mkdir('logs')
  
-    # TODO: Finish logging
-    logger = logging.getLogger('scraper_log')
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    file_handler = logging.FileHandler('./logs/scraper.log')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Stream
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    chformatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(chformatter)
+    logger.addHandler(ch)
+
     test_pin = [
         "17-34-326-006-0000",
+        "17-27-402-021-0000",
+        "17-34-312-093-1008",
+        "17-34-102-051-1078"
     ]
 
     start = time.perf_counter()
     main(test_pin)
     end = time.perf_counter()
-    print(f"Scraped one PIN in {end:0.4f} seconds") # To get an estimate for how long a whole nbhd would take
+    print(f"Scraped {len(test_pin)} PIN(s) in {end:0.4f} seconds") # To get an estimate for how long a whole nbhd would take
