@@ -2,6 +2,7 @@
 *.log
 *.db
 
+/figures
 /data
 /env
 /__pycache__
